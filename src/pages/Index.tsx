@@ -2,6 +2,7 @@ import { Link } from "react-router-dom";
 import { motion } from "framer-motion";
 import { Cpu, Zap, Shield, BarChart3, ArrowRight, Brain, AlertTriangle, Sliders, Map } from "lucide-react";
 import Navbar from "@/components/Navbar";
+import TrueFocus from "@/components/TrueFocus";
 
 const features = [
   {
@@ -65,7 +66,16 @@ const Index = () => {
             <h1 className="text-5xl sm:text-6xl lg:text-7xl font-bold tracking-tight leading-[1.1]">
               <span className="text-foreground">Evaluate Your</span>
               <br />
-              <span className="gradient-text neon-glow">Cloud Architecture</span>
+              <TrueFocus
+                sentence="Cloud Architecture"
+                manualMode={false}
+                blurAmount={4}
+                borderColor="hsl(185, 80%, 55%)"
+                glowColor="hsla(185, 80%, 55%, 0.6)"
+                animationDuration={0.5}
+                pauseBetweenAnimations={1.5}
+                className="text-5xl sm:text-6xl lg:text-7xl neon-glow mt-1"
+              />
             </h1>
 
             <p className="text-lg sm:text-xl text-muted-foreground max-w-2xl mx-auto leading-relaxed">
