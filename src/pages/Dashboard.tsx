@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { motion } from "framer-motion";
-import { BarChart3, TrendingUp, DollarSign, AlertTriangle, Plus, ArrowRight } from "lucide-react";
+import { motion, AnimatePresence } from "framer-motion";
+import { BarChart3, TrendingUp, DollarSign, AlertTriangle, Plus, ArrowRight, MoreVertical, Settings, User, LogOut } from "lucide-react";
 import AppLayout from "@/components/AppLayout";
+import Particles from "@/components/Particles";
 import { useAuth } from "@/contexts/AuthContext";
 import { supabase } from "@/integrations/supabase/client";
 import { RadarChart, PolarGrid, PolarAngleAxis, Radar, ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid } from "recharts";
@@ -19,6 +20,7 @@ interface ChatRow {
 const Dashboard = () => {
   const { user, profile } = useAuth();
   const [chats, setChats] = useState<ChatRow[]>([]);
+  const [isControlPanelOpen, setIsControlPanelOpen] = useState(false);
 
   useEffect(() => {
     if (!user) return;
@@ -50,7 +52,21 @@ const Dashboard = () => {
 
   return (
     <AppLayout>
-      <div className="p-6 max-w-6xl mx-auto space-y-6">
+      <div className="relative min-h-screen w-full overflow-hidden">
+        <div className="absolute inset-0 z-0">
+          <Particles
+            particleColors={["#ffffff"]}
+            particleCount={200}
+            particleSpread={10}
+            speed={0.1}
+            particleBaseSize={100}
+            moveParticlesOnHover
+            alphaParticles={false}
+            disableRotation={false}
+            pixelRatio={1}
+          />
+        </div>
+        <div className="relative z-10 p-6 max-w-6xl mx-auto space-y-6">
         <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
           <h1 className="text-2xl font-bold text-foreground">
             Welcome back, <span className="gradient-text">{profile?.name || "User"}</span>
@@ -157,6 +173,59 @@ const Dashboard = () => {
               )}
             </div>
           </motion.div>
+        </div>
+
+        {/* Control Panel */}
+        <div className="fixed bottom-6 right-6 z-20">
+          <motion.button
+            whileHover={{ scale: 1.05 }}
+            whileTap={{ scale: 0.95 }}
+            onClick={() => setIsControlPanelOpen(!isControlPanelOpen)}
+            className="w-12 h-12 rounded-full bg-primary text-primary-foreground shadow-lg flex items-center justify-center"
+          >
+            <MoreVertical className="h-5 w-5" />
+          </motion.button>
+
+          <AnimatePresence>
+            {isControlPanelOpen && (
+              <motion.div
+                initial={{ opacity: 0, scale: 0.8, y: 10 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.8, y: 10 }}
+                className="absolute bottom-14 right-0 w-64 glass-panel rounded-xl p-4 shadow-xl"
+              >
+                <div className="space-y-3">
+                  <Link
+                    to="/profile"
+                    className="flex items-center gap-3 p-2 rounded-lg hover:bg-muted/50 transition-colors"
+                    onClick={() => setIsControlPanelOpen(false)}
+                  >
+                    <User className="h-4 w-4" />
+                    <span className="text-sm">Profile</span>
+                  </Link>
+                  <Link
+                    to="/settings"
+                    className="flex items-center gap-3 p-2 rounded-lg hover:bg-muted/50 transition-colors"
+                    onClick={() => setIsControlPanelOpen(false)}
+                  >
+                    <Settings className="h-4 w-4" />
+                    <span className="text-sm">Settings</span>
+                  </Link>
+                  <button
+                    onClick={() => {
+                      supabase.auth.signOut();
+                      setIsControlPanelOpen(false);
+                    }}
+                    className="flex items-center gap-3 p-2 rounded-lg hover:bg-muted/50 transition-colors w-full text-left"
+                  >
+                    <LogOut className="h-4 w-4" />
+                    <span className="text-sm">Sign Out</span>
+                  </button>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
         </div>
       </div>
     </AppLayout>
