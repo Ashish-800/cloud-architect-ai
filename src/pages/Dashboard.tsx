@@ -52,7 +52,7 @@ const Dashboard = () => {
   return (
     <AppLayout>
       <div className="relative min-h-screen w-full overflow-hidden">
-        <div className="absolute inset-0 z-0">
+        <div style={{ width: '100%', height: '600px', position: 'relative' }}>
           <Particles
             particleColors={["#ffffff"]}
             particleCount={200}
