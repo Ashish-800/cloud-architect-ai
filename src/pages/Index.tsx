@@ -3,6 +3,7 @@ import { motion } from "framer-motion";
 import { Cpu, Zap, Shield, BarChart3, ArrowRight, Brain, AlertTriangle, Sliders, Map } from "lucide-react";
 import Navbar from "@/components/Navbar";
 import TrueFocus from "@/components/TrueFocus";
+import { useAuth } from "@/contexts/AuthContext";
 
 const features = [
   {
@@ -48,6 +49,7 @@ const features = [
 ];
 
 const Index = () => {
+  const { user } = useAuth();
   return (
     <div className="min-h-screen bg-background relative overflow-hidden">
       <div className="absolute inset-0 bg-grid opacity-30" />
@@ -84,12 +86,20 @@ const Index = () => {
 
             <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.3 }} className="flex flex-col sm:flex-row items-center justify-center gap-4 pt-4">
               <Link
-                to="/analyse"
+                to={user ? "/dashboard" : "/login"}
                 className="group inline-flex items-center gap-2 px-8 py-3.5 rounded-xl bg-primary text-primary-foreground font-semibold text-base transition-all hover:shadow-[0_0_30px_hsl(var(--neon-cyan)/0.3)] hover:scale-105"
               >
-                Launch Intelligence Engine
+                {user ? "Go to Dashboard" : "Get Started"}
                 <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-1" />
               </Link>
+              {!user && (
+                <Link
+                  to="/login"
+                  className="text-sm text-muted-foreground hover:text-foreground transition-colors"
+                >
+                  Already have an account? Sign in
+                </Link>
+              )}
             </motion.div>
           </motion.div>
         </div>
