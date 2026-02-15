@@ -61,8 +61,8 @@ const Analyse = () => {
   return (
     <AppLayout>
       <div className="min-h-screen relative overflow-hidden">
-        {/* Background - only show after results */}
-        {result && !isAnalyzing && (
+        {/* Background - show before analysis */}
+        {!result && (
           <>
             <div className="absolute inset-0 z-0">
               <Hyperspeed
