@@ -5,6 +5,96 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version',
 };
 
+// ─── AWS SIGNATURE V4 ───
+async function sign(key: ArrayBuffer, msg: string): Promise<ArrayBuffer> {
+  const cryptoKey = await crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return crypto.subtle.sign("HMAC", cryptoKey, new TextEncoder().encode(msg));
+}
+
+async function getSignatureKey(secret: string, date: string, region: string, service: string): Promise<ArrayBuffer> {
+  const kDate = await sign(new TextEncoder().encode("AWS4" + secret), date);
+  const kRegion = await sign(kDate, region);
+  const kService = await sign(kRegion, service);
+  const kSigning = await sign(kService, "aws4_request");
+  return kSigning;
+}
+
+function toHex(buffer: ArrayBuffer): string {
+  return Array.from(new Uint8Array(buffer)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function sha256Hex(data: string): Promise<string> {
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(data));
+  return toHex(hash);
+}
+
+async function bedrockInvoke(modelId: string, payload: object): Promise<any> {
+  const accessKeyId = Deno.env.get("AWS_ACCESS_KEY_ID");
+  const secretAccessKey = Deno.env.get("AWS_SECRET_ACCESS_KEY");
+  const region = Deno.env.get("AWS_REGION") || "us-east-1";
+
+  if (!accessKeyId || !secretAccessKey) {
+    throw new Error("AWS credentials not configured");
+  }
+
+  const body = JSON.stringify(payload);
+  const now = new Date();
+  const amzDate = now.toISOString().replace(/[:\-]|\.\d{3}/g, "").slice(0, 15) + "Z";
+  const dateStamp = amzDate.slice(0, 8);
+
+  const host = `bedrock-runtime.${region}.amazonaws.com`;
+  const path = `/model/${modelId}/invoke`;
+  const service = "bedrock";
+
+  const payloadHash = await sha256Hex(body);
+
+  const canonicalHeaders = `content-type:application/json\nhost:${host}\nx-amz-date:${amzDate}\n`;
+  const signedHeaders = "content-type;host;x-amz-date";
+  const canonicalRequest = `POST\n${path}\n\n${canonicalHeaders}\n${signedHeaders}\n${payloadHash}`;
+
+  const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
+  const stringToSign = `AWS4-HMAC-SHA256\n${amzDate}\n${credentialScope}\n${await sha256Hex(canonicalRequest)}`;
+
+  const signingKey = await getSignatureKey(secretAccessKey, dateStamp, region, service);
+  const signature = toHex(await sign(signingKey, stringToSign));
+
+  const authorizationHeader = `AWS4-HMAC-SHA256 Credential=${accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+
+  const response = await fetch(`https://${host}${path}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Host": host,
+      "X-Amz-Date": amzDate,
+      "Authorization": authorizationHeader,
+    },
+    body,
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Bedrock API error [${response.status}]: ${errText}`);
+  }
+
+  return response.json();
+}
+
+// ─── BEDROCK CLAUDE CALL ───
+async function callClaude(systemPrompt: string, userMessage: string): Promise<string> {
+  const modelId = "anthropic.claude-3-sonnet-20240229-v1:0";
+
+  const data = await bedrockInvoke(modelId, {
+    anthropic_version: "bedrock-2023-05-31",
+    max_tokens: 4096,
+    temperature: 0.3,
+    top_p: 0.9,
+    system: systemPrompt,
+    messages: [{ role: "user", content: userMessage }],
+  });
+
+  return data?.content?.[0]?.text || "";
+}
+
 // ─── AI DECOMPOSITION PROMPT ───
 const DECOMPOSITION_PROMPT = `You are a cloud architecture decomposition engine. Extract structured components from the user's description. Return ONLY valid JSON with these exact fields:
 
@@ -92,7 +182,6 @@ function scoreScalability(arch: ArchSummary, sim?: SimParams) {
   const explanation: string[] = [];
   const violated: string[] = [];
 
-  // Auto Scaling (25 pts)
   if (arch.scaling_type === "auto_scaling") {
     score += 25;
     explanation.push("Auto Scaling detected (+25)");
@@ -105,7 +194,6 @@ function scoreScalability(arch: ArchSummary, sim?: SimParams) {
     violated.push("Elastic Scalability Principle");
   }
 
-  // Load Balancer (20 pts)
   if (arch.load_balancer !== "none") {
     score += 20;
     explanation.push(`${arch.load_balancer.toUpperCase()} load balancer present (+20)`);
@@ -114,7 +202,6 @@ function scoreScalability(arch: ArchSummary, sim?: SimParams) {
     violated.push("Horizontal Distribution");
   }
 
-  // CDN (10 pts)
   if (arch.cdn !== "none") {
     score += 10;
     explanation.push(`CDN (${arch.cdn}) configured (+10)`);
@@ -123,7 +210,6 @@ function scoreScalability(arch: ArchSummary, sim?: SimParams) {
     violated.push("Edge Caching Strategy");
   }
 
-  // Caching Layer (10 pts)
   if (arch.caching_layer !== "none") {
     score += 10;
     explanation.push(`Caching layer (${arch.caching_layer}) present (+10)`);
@@ -132,7 +218,6 @@ function scoreScalability(arch: ArchSummary, sim?: SimParams) {
     violated.push("Latency Optimization");
   }
 
-  // Container/Serverless (15 pts)
   if (arch.container_orchestration !== "none") {
     score += 15;
     explanation.push(`Container orchestration (${arch.container_orchestration}) enabled (+15)`);
@@ -147,7 +232,6 @@ function scoreScalability(arch: ArchSummary, sim?: SimParams) {
     violated.push("Cloud-Native Scalability");
   }
 
-  // Microservices (10 pts)
   if (arch.microservices) {
     score += 10;
     explanation.push("Microservices architecture (+10)");
@@ -155,13 +239,11 @@ function scoreScalability(arch: ArchSummary, sim?: SimParams) {
     explanation.push("Monolithic architecture detected (+0)");
   }
 
-  // API Gateway (5 pts)
   if (arch.api_gateway) {
     score += 5;
     explanation.push("API Gateway configured (+5)");
   }
 
-  // Multi-region (5 pts)
   if (arch.multi_region || (sim?.add_regions && sim.add_regions > 0)) {
     score += 5;
     explanation.push("Multi-region deployment (+5)");
@@ -176,7 +258,6 @@ function scoreReliability(arch: ArchSummary) {
   const explanation: string[] = [];
   const violated: string[] = [];
 
-  // Multi-AZ (25 pts)
   if (arch.database_multi_az) {
     score += 25;
     explanation.push("Multi-AZ database deployment (+25)");
@@ -185,13 +266,11 @@ function scoreReliability(arch: ArchSummary) {
     violated.push("Availability Zone Redundancy");
   }
 
-  // Replicas (10 pts)
   if (arch.database_replicas > 0) {
     score += Math.min(10, arch.database_replicas * 5);
     explanation.push(`${arch.database_replicas} database replica(s) (+${Math.min(10, arch.database_replicas * 5)})`);
   }
 
-  // Backup Strategy (15 pts)
   if (arch.backup_strategy) {
     score += 15;
     explanation.push("Backup strategy configured (+15)");
@@ -200,7 +279,6 @@ function scoreReliability(arch: ArchSummary) {
     violated.push("Disaster Recovery Readiness");
   }
 
-  // Monitoring (15 pts)
   if (arch.monitoring !== "none") {
     score += 15;
     explanation.push(`Monitoring (${arch.monitoring}) active (+15)`);
@@ -209,13 +287,11 @@ function scoreReliability(arch: ArchSummary) {
     violated.push("Observability Principle");
   }
 
-  // Load Balancer Health Checks (10 pts)
   if (arch.load_balancer !== "none") {
     score += 10;
     explanation.push("Load balancer health checks implied (+10)");
   }
 
-  // Multi-region (10 pts)
   if (arch.multi_region) {
     score += 10;
     explanation.push("Multi-region redundancy (+10)");
@@ -223,7 +299,6 @@ function scoreReliability(arch: ArchSummary) {
     violated.push("Geographic Redundancy");
   }
 
-  // CI/CD (10 pts)
   if (arch.ci_cd) {
     score += 10;
     explanation.push("CI/CD pipeline detected (+10)");
@@ -231,7 +306,6 @@ function scoreReliability(arch: ArchSummary) {
     violated.push("Deployment Reliability");
   }
 
-  // Compute redundancy (5 pts)
   if (arch.compute_count > 1) {
     score += 5;
     explanation.push(`Multiple compute instances (${arch.compute_count}) (+5)`);
@@ -248,7 +322,6 @@ function scoreSecurity(arch: ArchSummary) {
   const explanation: string[] = [];
   const violated: string[] = [];
 
-  // WAF (20 pts)
   if (arch.waf) {
     score += 20;
     explanation.push("WAF enabled (+20)");
@@ -257,7 +330,6 @@ function scoreSecurity(arch: ArchSummary) {
     violated.push("Perimeter Defense");
   }
 
-  // Encryption (15 pts)
   if (arch.encryption) {
     score += 15;
     explanation.push("Encryption at rest/transit (+15)");
@@ -266,7 +338,6 @@ function scoreSecurity(arch: ArchSummary) {
     violated.push("Data Encryption Standard");
   }
 
-  // SSL/TLS (10 pts)
   if (arch.ssl_tls) {
     score += 10;
     explanation.push("SSL/TLS configured (+10)");
@@ -274,7 +345,6 @@ function scoreSecurity(arch: ArchSummary) {
     violated.push("Transport Layer Security");
   }
 
-  // VPC (15 pts)
   if (arch.vpc) {
     score += 15;
     explanation.push("VPC configured (+15)");
@@ -283,7 +353,6 @@ function scoreSecurity(arch: ArchSummary) {
     violated.push("Network Isolation");
   }
 
-  // Private Subnets (10 pts)
   if (arch.private_subnets) {
     score += 10;
     explanation.push("Private subnets configured (+10)");
@@ -291,7 +360,6 @@ function scoreSecurity(arch: ArchSummary) {
     violated.push("Network Segmentation");
   }
 
-  // IAM (15 pts)
   if (arch.iam_configured) {
     score += 15;
     explanation.push("IAM policies configured (+15)");
@@ -300,13 +368,11 @@ function scoreSecurity(arch: ArchSummary) {
     violated.push("Least Privilege Access");
   }
 
-  // Security Groups (10 pts)
   if (arch.security_groups) {
     score += 10;
     explanation.push("Security groups configured (+10)");
   }
 
-  // API Gateway (5 pts - for auth/throttling)
   if (arch.api_gateway) {
     score += 5;
     explanation.push("API Gateway adds throttling/auth layer (+5)");
@@ -321,7 +387,6 @@ function scoreCostEfficiency(arch: ArchSummary, sim?: SimParams) {
   const explanation: string[] = [];
   const violated: string[] = [];
 
-  // Serverless (25 pts)
   if (arch.serverless_components > 0 || arch.compute_model === "lambda") {
     score += 25;
     explanation.push("Serverless components reduce idle cost (+25)");
@@ -330,7 +395,6 @@ function scoreCostEfficiency(arch: ArchSummary, sim?: SimParams) {
     explanation.push("Fargate reduces operational overhead (+15)");
   }
 
-  // Reserved/Spot Instances (20 pts)
   if (arch.reserved_instances) {
     score += 15;
     explanation.push("Reserved instances for baseline savings (+15)");
@@ -343,19 +407,16 @@ function scoreCostEfficiency(arch: ArchSummary, sim?: SimParams) {
     violated.push("Instance Purchase Optimization");
   }
 
-  // CDN (10 pts)
   if (arch.cdn !== "none") {
     score += 10;
     explanation.push("CDN reduces origin server load (+10)");
   }
 
-  // Caching (10 pts)
   if (arch.caching_layer !== "none") {
     score += 10;
     explanation.push("Caching reduces database costs (+10)");
   }
 
-  // Right-sizing (15 pts)
   if (arch.scaling_type === "auto_scaling") {
     score += 15;
     explanation.push("Auto-scaling enables right-sizing (+15)");
@@ -363,19 +424,16 @@ function scoreCostEfficiency(arch: ArchSummary, sim?: SimParams) {
     violated.push("Dynamic Right-Sizing");
   }
 
-  // Monitoring for cost visibility (5 pts)
   if (arch.monitoring !== "none") {
     score += 5;
     explanation.push("Monitoring enables cost visibility (+5)");
   }
 
-  // Database optimization (5 pts)
   if (arch.database_type === "dynamodb" || arch.database_type === "aurora") {
     score += 5;
     explanation.push(`${arch.database_type} offers pay-per-use flexibility (+5)`);
   }
 
-  // Cost target simulation penalty
   if (sim?.cost_target && sim.cost_target > 0) {
     const penalty = Math.max(0, 10 - Math.floor(sim.cost_target / 10));
     if (penalty > 0) {
@@ -387,7 +445,6 @@ function scoreCostEfficiency(arch: ArchSummary, sim?: SimParams) {
   return { score: Math.min(score, max), max, explanation, violated_principles: violated };
 }
 
-// ─── RISK MODELING ENGINE ───
 interface Risk {
   type: string;
   component: string;
@@ -398,120 +455,42 @@ interface Risk {
 function analyzeRisks(arch: ArchSummary): { risk_level: string; risks: Risk[] } {
   const risks: Risk[] = [];
 
-  // Single point of failure - compute
   if (arch.compute_count === 1 && arch.compute_model !== "lambda") {
-    risks.push({
-      type: "Single Point of Failure",
-      component: `Single ${arch.compute_model.toUpperCase()} instance`,
-      impact: "Complete service downtime if instance fails. No failover capability.",
-      severity: "critical"
-    });
+    risks.push({ type: "Single Point of Failure", component: `Single ${arch.compute_model.toUpperCase()} instance`, impact: "Complete service downtime if instance fails. No failover capability.", severity: "critical" });
   }
-
-  // No scaling
   if (arch.scaling_type === "none") {
-    risks.push({
-      type: "Scaling Bottleneck",
-      component: "Compute layer",
-      impact: "Cannot handle traffic spikes. Service degradation under load.",
-      severity: "high"
-    });
+    risks.push({ type: "Scaling Bottleneck", component: "Compute layer", impact: "Cannot handle traffic spikes. Service degradation under load.", severity: "high" });
   }
-
-  // No load balancer with multiple instances
   if (arch.compute_count > 1 && arch.load_balancer === "none") {
-    risks.push({
-      type: "Traffic Distribution Gap",
-      component: "Network layer",
-      impact: "Multiple instances without load distribution. Uneven resource utilization.",
-      severity: "medium"
-    });
+    risks.push({ type: "Traffic Distribution Gap", component: "Network layer", impact: "Multiple instances without load distribution. Uneven resource utilization.", severity: "medium" });
   }
-
-  // Single AZ database
   if (arch.database_type !== "none" && !arch.database_multi_az) {
-    risks.push({
-      type: "Database Availability Risk",
-      component: `${arch.database_type.toUpperCase()} database`,
-      impact: "Single AZ deployment risks data loss and downtime during AZ failure.",
-      severity: "high"
-    });
+    risks.push({ type: "Database Availability Risk", component: `${arch.database_type.toUpperCase()} database`, impact: "Single AZ deployment risks data loss and downtime during AZ failure.", severity: "high" });
   }
-
-  // No backups
   if (!arch.backup_strategy && arch.database_type !== "none") {
-    risks.push({
-      type: "Data Loss Risk",
-      component: "Database layer",
-      impact: "No backup strategy detected. Risk of irrecoverable data loss.",
-      severity: "critical"
-    });
+    risks.push({ type: "Data Loss Risk", component: "Database layer", impact: "No backup strategy detected. Risk of irrecoverable data loss.", severity: "critical" });
   }
-
-  // No WAF
   if (!arch.waf) {
-    risks.push({
-      type: "Application Security Risk",
-      component: "Edge/Perimeter",
-      impact: "No WAF protection against OWASP Top 10 attacks (SQLi, XSS, etc).",
-      severity: "high"
-    });
+    risks.push({ type: "Application Security Risk", component: "Edge/Perimeter", impact: "No WAF protection against OWASP Top 10 attacks (SQLi, XSS, etc).", severity: "high" });
   }
-
-  // No VPC
   if (!arch.vpc) {
-    risks.push({
-      type: "Network Isolation Risk",
-      component: "Network layer",
-      impact: "Resources may be publicly accessible. Increased attack surface.",
-      severity: "high"
-    });
+    risks.push({ type: "Network Isolation Risk", component: "Network layer", impact: "Resources may be publicly accessible. Increased attack surface.", severity: "high" });
   }
-
-  // No encryption
   if (!arch.encryption) {
-    risks.push({
-      type: "Data Exposure Risk",
-      component: "Data layer",
-      impact: "Unencrypted data at rest/transit. Compliance and regulatory risk.",
-      severity: "medium"
-    });
+    risks.push({ type: "Data Exposure Risk", component: "Data layer", impact: "Unencrypted data at rest/transit. Compliance and regulatory risk.", severity: "medium" });
   }
-
-  // No monitoring
   if (arch.monitoring === "none") {
-    risks.push({
-      type: "Blind Spot Risk",
-      component: "Observability",
-      impact: "No monitoring means delayed incident detection. Increased MTTR.",
-      severity: "medium"
-    });
+    risks.push({ type: "Blind Spot Risk", component: "Observability", impact: "No monitoring means delayed incident detection. Increased MTTR.", severity: "medium" });
   }
-
-  // No caching under high traffic
   if (arch.caching_layer === "none" && arch.estimated_users > 1000) {
-    risks.push({
-      type: "Performance Saturation",
-      component: "Application layer",
-      impact: "High traffic without caching will cause latency spikes and DB overload.",
-      severity: "medium"
-    });
+    risks.push({ type: "Performance Saturation", component: "Application layer", impact: "High traffic without caching will cause latency spikes and DB overload.", severity: "medium" });
   }
-
-  // Single region
   if (!arch.multi_region) {
-    risks.push({
-      type: "Regional Dependency",
-      component: "Infrastructure",
-      impact: "Single region deployment. Regional outage causes complete service loss.",
-      severity: "low"
-    });
+    risks.push({ type: "Regional Dependency", component: "Infrastructure", impact: "Single region deployment. Regional outage causes complete service loss.", severity: "low" });
   }
 
-  // Determine overall risk level
   const criticalCount = risks.filter(r => r.severity === "critical").length;
   const highCount = risks.filter(r => r.severity === "high").length;
-
   let risk_level = "Low";
   if (criticalCount > 0) risk_level = "Critical";
   else if (highCount >= 2) risk_level = "High";
@@ -520,14 +499,11 @@ function analyzeRisks(arch: ArchSummary): { risk_level: string; risks: Risk[] } 
   return { risk_level, risks };
 }
 
-// ─── COST PROJECTION ENGINE ───
 function analyzeCosts(arch: ArchSummary, sim?: SimParams) {
   const trafficMul = sim?.traffic_multiplier || 1;
   const breakdown: { category: string; current: number; optimized: number }[] = [];
 
-  // Compute costs
-  let computeCost = 0;
-  let computeOptimized = 0;
+  let computeCost = 0, computeOptimized = 0;
   if (arch.compute_model === "ec2") {
     computeCost = (arch.compute_count || 1) * 85 * trafficMul;
     computeOptimized = arch.reserved_instances ? computeCost * 0.6 : (arch.spot_instances ? computeCost * 0.5 : computeCost * 0.8);
@@ -543,9 +519,7 @@ function analyzeCosts(arch: ArchSummary, sim?: SimParams) {
   }
   breakdown.push({ category: "Compute", current: Math.round(computeCost), optimized: Math.round(computeOptimized) });
 
-  // Database costs
-  let dbCost = 0;
-  let dbOptimized = 0;
+  let dbCost = 0, dbOptimized = 0;
   if (arch.database_type === "rds") {
     dbCost = arch.database_multi_az ? 280 : 140;
     dbCost += arch.database_replicas * 100;
@@ -558,85 +532,37 @@ function analyzeCosts(arch: ArchSummary, sim?: SimParams) {
     dbOptimized = dbCost * 0.7;
   }
   if (dbCost > 0) breakdown.push({ category: "Database", current: Math.round(dbCost), optimized: Math.round(dbOptimized) });
+  if (arch.caching_layer !== "none") breakdown.push({ category: "Caching", current: 45, optimized: 40 });
+  if (arch.load_balancer !== "none") breakdown.push({ category: "Load Balancer", current: arch.load_balancer === "alb" ? 25 : 20, optimized: arch.load_balancer === "alb" ? 25 : 20 });
+  if (arch.cdn !== "none") breakdown.push({ category: "CDN", current: Math.round(30 * trafficMul), optimized: Math.round(25 * trafficMul) });
+  if (arch.monitoring !== "none") breakdown.push({ category: "Monitoring", current: 35, optimized: 35 });
+  if (arch.waf) breakdown.push({ category: "WAF", current: 20, optimized: 20 });
 
-  // Caching costs
-  if (arch.caching_layer !== "none") {
-    const cacheCost = 45;
-    breakdown.push({ category: "Caching", current: cacheCost, optimized: Math.round(cacheCost * 0.9) });
-  }
-
-  // Load Balancer costs
-  if (arch.load_balancer !== "none") {
-    const lbCost = arch.load_balancer === "alb" ? 25 : 20;
-    breakdown.push({ category: "Load Balancer", current: lbCost, optimized: lbCost });
-  }
-
-  // CDN costs
-  if (arch.cdn !== "none") {
-    const cdnCost = 30 * trafficMul;
-    breakdown.push({ category: "CDN", current: Math.round(cdnCost), optimized: Math.round(cdnCost * 0.85) });
-  }
-
-  // Monitoring costs
-  if (arch.monitoring !== "none") {
-    breakdown.push({ category: "Monitoring", current: 35, optimized: 35 });
-  }
-
-  // WAF costs
-  if (arch.waf) {
-    breakdown.push({ category: "WAF", current: 20, optimized: 20 });
-  }
-
-  // Multi-region multiplier
   const regionMultiplier = arch.multi_region ? 1.8 : 1;
-  const simRegions = sim?.add_regions || 0;
-  const totalMultiplier = regionMultiplier + (simRegions * 0.6);
+  const totalMultiplier = regionMultiplier + ((sim?.add_regions || 0) * 0.6);
 
   const total_current = Math.round(breakdown.reduce((s, b) => s + b.current, 0) * totalMultiplier);
   const total_optimized = Math.round(breakdown.reduce((s, b) => s + b.optimized, 0) * totalMultiplier);
-
-  // Apply cost target if provided
   let finalOptimized = total_optimized;
-  if (sim?.cost_target && sim.cost_target > 0 && sim.cost_target < total_optimized) {
-    finalOptimized = sim.cost_target;
-  }
+  if (sim?.cost_target && sim.cost_target > 0 && sim.cost_target < total_optimized) finalOptimized = sim.cost_target;
 
   return {
     total_current,
     total_optimized: finalOptimized,
     monthly_savings: total_current - finalOptimized,
-    breakdown: breakdown.map(b => ({
-      ...b,
-      current: Math.round(b.current * totalMultiplier),
-      optimized: Math.round(b.optimized * totalMultiplier),
-    })),
+    breakdown: breakdown.map(b => ({ ...b, current: Math.round(b.current * totalMultiplier), optimized: Math.round(b.optimized * totalMultiplier) })),
   };
 }
 
-// ─── CONFIDENCE & MATURITY ───
 function calculateConfidence(arch: ArchSummary): number {
-  let fields = 0;
-  let filled = 0;
-  const checks: boolean[] = [
-    arch.compute_model !== "none",
-    arch.compute_count > 0,
-    arch.scaling_type !== "none",
-    arch.database_type !== "none",
-    arch.load_balancer !== "none",
-    arch.vpc,
-    arch.monitoring !== "none",
-    arch.encryption,
-    arch.ssl_tls,
-    arch.iam_configured,
-    arch.caching_layer !== "none",
-    arch.cdn !== "none",
-    arch.backup_strategy,
-    arch.ci_cd,
-    arch.estimated_users > 0,
+  const checks = [
+    arch.compute_model !== "none", arch.compute_count > 0, arch.scaling_type !== "none",
+    arch.database_type !== "none", arch.load_balancer !== "none", arch.vpc,
+    arch.monitoring !== "none", arch.encryption, arch.ssl_tls, arch.iam_configured,
+    arch.caching_layer !== "none", arch.cdn !== "none", arch.backup_strategy,
+    arch.ci_cd, arch.estimated_users > 0,
   ];
-  fields = checks.length;
-  filled = checks.filter(Boolean).length;
-  return Math.round((filled / fields) * 100) / 100;
+  return Math.round((checks.filter(Boolean).length / checks.length) * 100) / 100;
 }
 
 function determineMaturity(overall: number, confidence: number): string {
@@ -646,96 +572,53 @@ function determineMaturity(overall: number, confidence: number): string {
   return "Prototype";
 }
 
-// ─── IMPROVEMENT PLAN GENERATOR ───
-function generateImprovementPlan(arch: ArchSummary, scores: any): { phase: number; title: string; actions: string[]; impact: string }[] {
+function generateImprovementPlan(arch: ArchSummary, scores: any) {
   const phases: { phase: number; title: string; actions: string[]; impact: string }[] = [];
   let phaseNum = 1;
 
-  // Phase: Scaling
   if (scores.scalability.score < 50) {
     const actions: string[] = [];
     if (arch.scaling_type !== "auto_scaling") actions.push("Implement Auto Scaling Groups with target tracking policies");
     if (arch.load_balancer === "none") actions.push("Deploy Application Load Balancer with health checks");
     if (arch.caching_layer === "none") actions.push("Add ElastiCache Redis for session/query caching");
-    if (actions.length > 0) {
-      phases.push({ phase: phaseNum++, title: "Scalability Foundation", actions, impact: `+${Math.min(40, 100 - scores.scalability.score)} scalability points` });
-    }
+    if (actions.length > 0) phases.push({ phase: phaseNum++, title: "Scalability Foundation", actions, impact: `+${Math.min(40, 100 - scores.scalability.score)} scalability points` });
   }
-
-  // Phase: Reliability
   if (scores.reliability.score < 50) {
     const actions: string[] = [];
     if (!arch.database_multi_az) actions.push("Enable Multi-AZ for database failover");
     if (!arch.backup_strategy) actions.push("Configure automated daily backups with 30-day retention");
     if (arch.monitoring === "none") actions.push("Deploy CloudWatch with custom dashboards and alarms");
     if (!arch.ci_cd) actions.push("Set up CI/CD pipeline with blue-green deployments");
-    if (actions.length > 0) {
-      phases.push({ phase: phaseNum++, title: "Reliability Hardening", actions, impact: `+${Math.min(40, 100 - scores.reliability.score)} reliability points` });
-    }
+    if (actions.length > 0) phases.push({ phase: phaseNum++, title: "Reliability Hardening", actions, impact: `+${Math.min(40, 100 - scores.reliability.score)} reliability points` });
   }
-
-  // Phase: Security
   if (scores.security.score < 60) {
     const actions: string[] = [];
     if (!arch.waf) actions.push("Enable AWS WAF with managed rule sets (OWASP)");
     if (!arch.encryption) actions.push("Enable encryption at rest (KMS) and in transit");
     if (!arch.vpc) actions.push("Migrate to VPC with public/private subnet architecture");
     if (!arch.iam_configured) actions.push("Implement IAM roles with least-privilege policies");
-    if (actions.length > 0) {
-      phases.push({ phase: phaseNum++, title: "Security Posture", actions, impact: `+${Math.min(40, 100 - scores.security.score)} security points` });
-    }
+    if (actions.length > 0) phases.push({ phase: phaseNum++, title: "Security Posture", actions, impact: `+${Math.min(40, 100 - scores.security.score)} security points` });
   }
-
-  // Phase: Cost
   if (scores.cost_efficiency.score < 50) {
     const actions: string[] = [];
     if (!arch.reserved_instances && arch.compute_model === "ec2") actions.push("Purchase Reserved Instances for baseline capacity (up to 40% savings)");
     if (arch.serverless_components === 0) actions.push("Migrate suitable workloads to Lambda/Fargate");
     if (arch.cdn === "none") actions.push("Add CloudFront CDN to reduce origin server costs");
-    if (actions.length > 0) {
-      phases.push({ phase: phaseNum++, title: "Cost Optimization", actions, impact: `+${Math.min(30, 100 - scores.cost_efficiency.score)} cost efficiency points` });
-    }
+    if (actions.length > 0) phases.push({ phase: phaseNum++, title: "Cost Optimization", actions, impact: `+${Math.min(30, 100 - scores.cost_efficiency.score)} cost efficiency points` });
   }
-
-  // Phase: Multi-region
   if (!arch.multi_region) {
-    phases.push({
-      phase: phaseNum++,
-      title: "Geographic Expansion",
-      actions: [
-        "Deploy to secondary AWS region with Route53 failover",
-        "Configure cross-region database replication",
-        "Set up CloudFront with multi-origin configuration"
-      ],
-      impact: "+5-10 points across all categories"
-    });
+    phases.push({ phase: phaseNum++, title: "Geographic Expansion", actions: ["Deploy to secondary AWS region with Route53 failover", "Configure cross-region database replication", "Set up CloudFront with multi-origin configuration"], impact: "+5-10 points across all categories" });
   }
-
   if (phases.length === 0) {
-    phases.push({
-      phase: 1,
-      title: "Advanced Optimization",
-      actions: [
-        "Implement chaos engineering with AWS Fault Injection Simulator",
-        "Add distributed tracing with X-Ray",
-        "Implement FinOps practices with Cost Explorer automation"
-      ],
-      impact: "Operational excellence and cost visibility"
-    });
+    phases.push({ phase: 1, title: "Advanced Optimization", actions: ["Implement chaos engineering with AWS Fault Injection Simulator", "Add distributed tracing with X-Ray", "Implement FinOps practices with Cost Explorer automation"], impact: "Operational excellence and cost visibility" });
   }
-
   return phases;
 }
 
-// ─── APPLY SIMULATION ───
 function applySimulation(arch: ArchSummary, sim: SimParams): ArchSummary {
   const modified = { ...arch };
-  if (sim.add_regions && sim.add_regions > 0) {
-    modified.multi_region = true;
-  }
-  if (sim.traffic_multiplier && sim.traffic_multiplier > 1) {
-    modified.estimated_users = Math.round((modified.estimated_users || 100) * sim.traffic_multiplier);
-  }
+  if (sim.add_regions && sim.add_regions > 0) modified.multi_region = true;
+  if (sim.traffic_multiplier && sim.traffic_multiplier > 1) modified.estimated_users = Math.round((modified.estimated_users || 100) * sim.traffic_multiplier);
   return modified;
 }
 
@@ -752,56 +635,49 @@ serve(async (req) => {
     let arch: ArchSummary;
 
     if (architecture_summary) {
-      // Simulation mode - skip AI decomposition
       arch = architecture_summary;
     } else if (description && typeof description === 'string' && description.trim().length > 0) {
-      // Full analysis mode - AI decomposition
-      const LOVABLE_API_KEY = Deno.env.get('LOVABLE_API_KEY');
-      if (!LOVABLE_API_KEY) throw new Error('LOVABLE_API_KEY is not configured');
+      // Full analysis mode — use Amazon Bedrock Claude 3 Sonnet
+      const awsAccessKey = Deno.env.get("AWS_ACCESS_KEY_ID");
+      const awsSecretKey = Deno.env.get("AWS_SECRET_ACCESS_KEY");
 
-      const decompResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${LOVABLE_API_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'google/gemini-3-flash-preview',
-          messages: [
-            { role: 'system', content: DECOMPOSITION_PROMPT },
-            { role: 'user', content: description },
-          ],
-        }),
-      });
+      if (!awsAccessKey || !awsSecretKey) {
+        // Fallback to Lovable AI if Bedrock not configured
+        const LOVABLE_API_KEY = Deno.env.get('LOVABLE_API_KEY');
+        if (!LOVABLE_API_KEY) throw new Error('No AI provider configured');
 
-      if (!decompResponse.ok) {
-        if (decompResponse.status === 429) {
-          return new Response(JSON.stringify({ error: 'Rate limit exceeded. Please try again.' }), { status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-        }
-        throw new Error(`AI decomposition failed: ${decompResponse.status}`);
+        const decompResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${LOVABLE_API_KEY}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'google/gemini-3-flash-preview',
+            messages: [{ role: 'system', content: DECOMPOSITION_PROMPT }, { role: 'user', content: description }],
+          }),
+        });
+        if (!decompResponse.ok) throw new Error(`AI fallback failed: ${decompResponse.status}`);
+        const decompData = await decompResponse.json();
+        const content = decompData.choices?.[0]?.message?.content || '';
+        arch = JSON.parse(content.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim());
+      } else {
+        // Use Amazon Bedrock Claude 3 Sonnet
+        console.log("Using Amazon Bedrock Claude 3 Sonnet for decomposition...");
+        const content = await callClaude(DECOMPOSITION_PROMPT, description);
+        const clean = content.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+        arch = JSON.parse(clean);
       }
-
-      const decompData = await decompResponse.json();
-      const content = decompData.choices?.[0]?.message?.content;
-      if (!content) throw new Error('No content from AI decomposition');
-
-      const clean = content.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-      arch = JSON.parse(clean);
     } else {
       return new Response(JSON.stringify({ error: 'Either description or architecture_summary is required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
-    // Apply simulation modifications
     const simParams: SimParams | undefined = simulation;
     const effectiveArch = simParams ? applySimulation(arch, simParams) : arch;
 
-    // Deterministic scoring
     const scalability = scoreScalability(effectiveArch, simParams);
     const reliability = scoreReliability(effectiveArch);
     const security = scoreSecurity(effectiveArch);
     const cost_efficiency = scoreCostEfficiency(effectiveArch, simParams);
 
-    const overall = Math.round(
-      scalability.score * 0.3 + reliability.score * 0.25 + security.score * 0.25 + cost_efficiency.score * 0.2
-    );
-
+    const overall = Math.round(scalability.score * 0.3 + reliability.score * 0.25 + security.score * 0.25 + cost_efficiency.score * 0.2);
     const scores = { overall, scalability, reliability, security, cost_efficiency };
     const risk_analysis = analyzeRisks(effectiveArch);
     const cost_analysis = analyzeCosts(effectiveArch, simParams);
@@ -809,26 +685,29 @@ serve(async (req) => {
     const maturity_level = determineMaturity(overall, confidence_score);
     const improvement_plan = generateImprovementPlan(effectiveArch, scores);
 
-    // AI Explanation (only for full analysis, skip for simulation)
+    // AI Explanation — use Bedrock if available, else Lovable AI
     let ai_explanation = "";
     if (!architecture_summary) {
       try {
-        const LOVABLE_API_KEY = Deno.env.get('LOVABLE_API_KEY');
-        if (LOVABLE_API_KEY) {
-          const explainResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${LOVABLE_API_KEY}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              model: 'google/gemini-3-flash-preview',
-              messages: [
-                { role: 'system', content: EXPLANATION_PROMPT },
-                { role: 'user', content: `Architecture: ${JSON.stringify(arch)}\n\nScores: ${JSON.stringify(scores)}\n\nRisks: ${JSON.stringify(risk_analysis)}\n\nCost: ${JSON.stringify(cost_analysis)}` },
-              ],
-            }),
-          });
-          if (explainResponse.ok) {
-            const explainData = await explainResponse.json();
-            ai_explanation = explainData.choices?.[0]?.message?.content || "";
+        const awsAccessKey = Deno.env.get("AWS_ACCESS_KEY_ID");
+        const awsSecretKey = Deno.env.get("AWS_SECRET_ACCESS_KEY");
+        const analysisContext = `Architecture: ${JSON.stringify(arch)}\n\nScores: ${JSON.stringify(scores)}\n\nRisks: ${JSON.stringify(risk_analysis)}\n\nCost: ${JSON.stringify(cost_analysis)}`;
+
+        if (awsAccessKey && awsSecretKey) {
+          console.log("Using Amazon Bedrock Claude 3 Sonnet for explanation...");
+          ai_explanation = await callClaude(EXPLANATION_PROMPT, analysisContext);
+        } else {
+          const LOVABLE_API_KEY = Deno.env.get('LOVABLE_API_KEY');
+          if (LOVABLE_API_KEY) {
+            const explainResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
+              method: 'POST',
+              headers: { 'Authorization': `Bearer ${LOVABLE_API_KEY}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ model: 'google/gemini-3-flash-preview', messages: [{ role: 'system', content: EXPLANATION_PROMPT }, { role: 'user', content: analysisContext }] }),
+            });
+            if (explainResponse.ok) {
+              const explainData = await explainResponse.json();
+              ai_explanation = explainData.choices?.[0]?.message?.content || "";
+            }
           }
         }
       } catch (e) {
@@ -846,12 +725,11 @@ serve(async (req) => {
       ai_explanation,
       confidence_score,
       maturity_level,
+      ai_provider: Deno.env.get("AWS_ACCESS_KEY_ID") ? "Amazon Bedrock (Claude 3 Sonnet)" : "Lovable AI (Gemini)",
       timestamp: new Date().toISOString(),
     };
 
-    return new Response(JSON.stringify(result), {
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-    });
+    return new Response(JSON.stringify(result), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   } catch (error) {
     console.error('analyze-architecture error:', error);
     return new Response(JSON.stringify({ error: error instanceof Error ? error.message : 'Analysis failed' }), {
